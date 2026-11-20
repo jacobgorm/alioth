@@ -15,6 +15,8 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 alioth = { path = "alioth", version = "0.12.0" }
+# Out-of-tree, used only by the `swap-disk` feature.
+block-swap = { path = "../mindcastle.io/mindcastle-rs/block-swap" }
 alioth-macros = { path = "alioth-macros", version = "0.12.0" }
 assert_matches = "1"
 ctor = "1.0"

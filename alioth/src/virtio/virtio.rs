@@ -57,6 +57,12 @@ pub enum Error {
         path: Box<Path>,
         error: std::fs::TryLockError,
     },
+    #[cfg(feature = "swap-disk")]
+    #[snafu(display("Failed to open block-swap image {path:?}"))]
+    SwapOpen {
+        path: Box<Path>,
+        error: std::io::Error,
+    },
     #[snafu(display("Error from OS"), context(false))]
     System { error: std::io::Error },
     #[snafu(display("Failed to create a poll"))]

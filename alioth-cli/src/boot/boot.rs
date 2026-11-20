@@ -436,6 +436,8 @@ fn create<H: Hypervisor>(hypervisor: &H, spec: VmSpec) -> Result<Machine<H>, ali
     for (index, blk_spec) in spec.blk.into_iter().enumerate() {
         match blk_spec {
             BlkSpec::File(file_spec) => vm.add_virtio_dev(format!("virtio-blk-{index}"), file_spec),
+            #[cfg(feature = "swap-disk")]
+            BlkSpec::Swap(swap_spec) => vm.add_virtio_dev(format!("virtio-blk-{index}"), swap_spec),
             #[cfg(target_os = "linux")]
             BlkSpec::Vu(s) => {
                 let vu_spec = VuFrontendSpec {

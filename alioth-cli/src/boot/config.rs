@@ -24,6 +24,8 @@ use alioth::loader::PayloadSpec;
 use alioth::vfio::{VfioCdevSpec, VfioContainerSpec, VfioGroupSpec, VfioIoasSpec, VfioUserSpec};
 use alioth::virtio::dev::balloon::BalloonSpec;
 use alioth::virtio::dev::blk::BlkFileSpec;
+#[cfg(feature = "swap-disk")]
+use alioth::virtio::dev::blk::SwapDiskSpec;
 use alioth::virtio::dev::entropy::EntropySpec;
 use alioth::virtio::dev::fs::shared_dir::SharedDirSpec;
 #[cfg(target_os = "macos")]
@@ -61,6 +63,10 @@ pub enum BlkSpec {
     /// VirtIO block device backed a disk image file.
     #[serde(alias = "file")]
     File(BlkFileSpec),
+    /// VirtIO block device backed by a mindcastle block-swap image.
+    #[cfg(feature = "swap-disk")]
+    #[serde(alias = "swap")]
+    Swap(SwapDiskSpec),
     #[cfg(target_os = "linux")]
     #[serde(alias = "vu")]
     /// vhost-user block device over a Unix domain socket.

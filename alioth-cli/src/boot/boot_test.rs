@@ -25,6 +25,8 @@ use alioth::mem::{MemBackend, MemSpec};
 use alioth::vfio::{VfioCdevSpec, VfioContainerSpec, VfioGroupSpec, VfioIoasSpec, VfioUserSpec};
 use alioth::virtio::dev::balloon::BalloonSpec;
 use alioth::virtio::dev::blk::BlkFileSpec;
+#[cfg(feature = "swap-disk")]
+use alioth::virtio::dev::blk::SwapDiskSpec;
 use alioth::virtio::dev::entropy::EntropySpec;
 use alioth::virtio::dev::fs::shared_dir::SharedDirSpec;
 #[cfg(target_os = "linux")]
@@ -378,6 +380,13 @@ fn test_parse_payload_arg(#[case] mut args: BootArgs, #[case] want: PayloadSpec)
         path: Path::new("ubuntu-25.04-server-cloudimg.raw").into(),
         readonly: false,
         api: WorkerApi::IoUring
+    })
+))]
+#[cfg_attr(feature = "swap-disk", case(
+    "swap,path=demo.swap",
+    BlkSpec::Swap(SwapDiskSpec {
+        path: Path::new("demo.swap").into(),
+        api: WorkerApi::Mio
     })
 ))]
 fn test_parse_blk_arg(#[case] arg: &str, #[case] want: BlkSpec) {

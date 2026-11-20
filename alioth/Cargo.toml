@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 alioth-macros.workspace = true
 bitfield = "0.20.0"
+block-swap = { workspace = true, optional = true }
 bitflags = "2.11.1"
 flume.workspace = true
 jiff = { version = "1", default-features = false }
@@ -32,4 +33,5 @@ tempfile.workspace = true
 io-uring = "0.7"
 
 [features]
+swap-disk = ["dep:block-swap"]
 test-hv = []

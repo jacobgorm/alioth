@@ -13,3 +13,5 @@
 // limitations under the License.
 
 pub mod qcow2;
+#[cfg(feature = "swap-disk")]
+pub mod swap;

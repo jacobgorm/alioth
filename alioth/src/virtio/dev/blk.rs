@@ -15,7 +15,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{IoSlice, IoSliceMut, Read};
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -34,6 +34,8 @@ use serde_aco::Help;
 use snafu::ResultExt;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
 
+#[cfg(feature = "swap-disk")]
+use crate::blk::swap::SwapDisk;
 use crate::sync::notifier::Notifier;
 use crate::virtio::dev::{DevSpec, Virtio, WorkerParam};
 use crate::virtio::queue::{DescChain, Status as QStatus, VirtQueue};
@@ -76,6 +78,9 @@ pub struct Request {
 pub const VIRTIO_BLK_ID_SIZE: usize = 20;
 
 const SECTOR_SIZE: usize = 1 << 9;
+
+/// Size of one `virtio_blk_discard_write_zeroes` segment.
+const DISCARD_SEGMENT_SIZE: usize = 16;
 
 bitflags! {
     pub struct BlockFeature(u128) {
@@ -151,6 +156,116 @@ impl DevSpec for BlkFileSpec {
     }
 }
 
+/// A VirtIO block device backed by a mindcastle block-swap image.
+#[cfg(feature = "swap-disk")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Help)]
+pub struct SwapDiskSpec {
+    /// Path to a mindcastle `.swap` image.
+    pub path: Box<Path>,
+    /// System API for asynchronous IO. Swap requests are completed
+    /// synchronously on the device worker, so this only selects the event
+    /// loop that drives the queues. [default: mio]
+    #[serde(default)]
+    pub api: WorkerApi,
+}
+
+#[cfg(feature = "swap-disk")]
+impl DevSpec for SwapDiskSpec {
+    type Device = Block;
+
+    fn build(self, name: impl Into<Arc<str>>) -> Result<Block> {
+        Block::new_swap(self, name)
+    }
+}
+
+/// The storage behind a VirtIO block device.
+#[derive(Debug)]
+enum Disk {
+    File(File),
+    #[cfg(feature = "swap-disk")]
+    Swap(SwapDisk),
+}
+
+impl Disk {
+    /// Returns `true` if the backend has a file descriptor that the io_uring
+    /// worker can submit requests against.
+    fn has_fd(&self) -> bool {
+        matches!(self, Disk::File(_))
+    }
+
+    /// Returns `true` if the backend supports discard and write-zeroes.
+    fn supports_discard(&self) -> bool {
+        match self {
+            Disk::File(_) => false,
+            #[cfg(feature = "swap-disk")]
+            Disk::Swap(_) => true,
+        }
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        match self {
+            Disk::File(file) => file.read_exact_at(buf, offset),
+            #[cfg(feature = "swap-disk")]
+            Disk::Swap(swap) => swap.read_at(offset, buf),
+        }
+    }
+
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        match self {
+            Disk::File(file) => file.write_all_at(buf, offset),
+            #[cfg(feature = "swap-disk")]
+            Disk::Swap(swap) => swap.write_at(offset, buf),
+        }
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        match self {
+            Disk::File(file) => file.sync_data(),
+            #[cfg(feature = "swap-disk")]
+            Disk::Swap(swap) => swap.flush(),
+        }
+    }
+
+    fn discard(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        match self {
+            Disk::File(_) => {
+                let _ = (offset, len);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "discard is not supported",
+                ))
+            }
+            #[cfg(feature = "swap-disk")]
+            Disk::Swap(swap) => swap.discard(offset, len),
+        }
+    }
+
+    fn write_zeroes(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        match self {
+            Disk::File(_) => {
+                let _ = (offset, len);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "write-zeroes is not supported",
+                ))
+            }
+            #[cfg(feature = "swap-disk")]
+            Disk::Swap(swap) => swap.write_zeroes(offset, len),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Disk::File(file) => file.as_raw_fd(),
+            // Swap requests never reach the io_uring path; they are
+            // completed synchronously in `Block::handle_desc`.
+            #[cfg(feature = "swap-disk")]
+            Disk::Swap(_) => -1,
+        }
+    }
+}
+
 enum BlkRequest<'d, 'm> {
     Done {
         written: u32,
@@ -174,7 +289,7 @@ enum BlkRequest<'d, 'm> {
 pub struct Block {
     name: Arc<str>,
     config: Arc<BlockConfig>,
-    disk: File,
+    disk: Disk,
     feature: BlockFeature,
     api: WorkerApi,
 }
@@ -212,7 +327,36 @@ impl Block {
         }
         Ok(Block {
             name: name.into(),
-            disk,
+            disk: Disk::File(disk),
+            config,
+            feature,
+            api: spec.api,
+        })
+    }
+
+    /// Opens a block-swap image as the backing store.
+    #[cfg(feature = "swap-disk")]
+    pub fn new_swap(spec: SwapDiskSpec, name: impl Into<Arc<str>>) -> Result<Self> {
+        let swap_open = error::SwapOpen {
+            path: spec.path.as_ref(),
+        };
+        let disk = SwapDisk::open(&spec.path).context(swap_open)?;
+        let config = BlockConfig {
+            capacity: disk.len() / SECTOR_SIZE as u64,
+            num_queues: 1,
+            max_discard_sectors: u32::MAX,
+            max_discard_seg: 32,
+            discard_sector_alignment: 1,
+            max_write_zeroes_sectors: u32::MAX,
+            max_write_zeroes_seg: 32,
+            write_zeroes_may_unmap: 1,
+            ..Default::default()
+        };
+        let config = Arc::new(config);
+        let feature = BlockFeature::FLUSH | BlockFeature::DISCARD | BlockFeature::WRITE_ZEROS;
+        Ok(Block {
+            name: name.into(),
+            disk: Disk::Swap(disk),
             config,
             feature,
             api: spec.api,
@@ -238,6 +382,20 @@ impl Block {
                 let [data] = data_in else {
                     return error::InvalidBuffer.fail();
                 };
+                if !self.disk.has_fd() {
+                    let written = match self.disk.read_exact_at(data, offset) {
+                        Ok(()) => {
+                            *status = Status::OK.into();
+                            data.len() as u32 + 1
+                        }
+                        Err(e) => {
+                            log::error!("{}: read: {e}", self.name);
+                            *status = Status::IOERR.into();
+                            1
+                        }
+                    };
+                    return Ok(BlkRequest::Done { written });
+                }
                 Ok(BlkRequest::In {
                     data,
                     offset,
@@ -253,13 +411,110 @@ impl Block {
                 let [data] = data_out else {
                     return error::InvalidBuffer.fail();
                 };
+                if !self.disk.has_fd() {
+                    let written = match self.disk.write_all_at(data, offset) {
+                        Ok(()) => {
+                            *status = Status::OK.into();
+                            1
+                        }
+                        Err(e) => {
+                            log::error!("{}: write: {e}", self.name);
+                            *status = Status::IOERR.into();
+                            1
+                        }
+                    };
+                    return Ok(BlkRequest::Done { written });
+                }
                 Ok(BlkRequest::Out {
                     data,
                     offset,
                     status,
                 })
             }
-            RequestType::FLUSH => Ok(BlkRequest::Flush { status }),
+            RequestType::FLUSH => {
+                if !self.disk.has_fd() {
+                    let written = match self.disk.sync_data() {
+                        Ok(()) => {
+                            *status = Status::OK.into();
+                            1
+                        }
+                        Err(e) => {
+                            log::error!("{}: flush: {e}", self.name);
+                            *status = Status::IOERR.into();
+                            1
+                        }
+                    };
+                    return Ok(BlkRequest::Done { written });
+                }
+                Ok(BlkRequest::Flush { status })
+            }
+            RequestType::DISCARD | RequestType::WRITE_ZEROES => {
+                if !self.disk.supports_discard() {
+                    log::error!(
+                        "{}: unimplemented op on this disk: {:#x?}",
+                        self.name,
+                        request.type_
+                    );
+                    *status = Status::UNSUPP.into();
+                    return Ok(BlkRequest::Done { written: 1 });
+                }
+                let mut segments = Vec::new();
+                for slice in data_out {
+                    segments.extend_from_slice(slice);
+                }
+                if segments.is_empty() || segments.len() % DISCARD_SEGMENT_SIZE != 0 {
+                    return error::InvalidBuffer.fail();
+                }
+                let capacity = self.config.capacity * SECTOR_SIZE as u64;
+                let result = (|| -> std::io::Result<()> {
+                    let (segments, _) = segments.as_chunks::<DISCARD_SEGMENT_SIZE>();
+                    for segment in segments {
+                        let sector = u64::from_le_bytes(segment[0..8].try_into().unwrap());
+                        let num_sectors =
+                            u32::from_le_bytes(segment[8..12].try_into().unwrap()) as u64;
+                        // The flags only say whether write-zeroes may unmap;
+                        // the swap backend writes zeroes either way.
+                        let offset = sector.checked_mul(SECTOR_SIZE as u64).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "discard offset overflows",
+                            )
+                        })?;
+                        let len = num_sectors.checked_mul(SECTOR_SIZE as u64).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "discard length overflows",
+                            )
+                        })?;
+                        let end = offset.checked_add(len).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "discard range overflows",
+                            )
+                        })?;
+                        if end > capacity {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "discard range beyond end of disk",
+                            ));
+                        }
+                        if request.type_ == RequestType::DISCARD {
+                            self.disk.discard(offset, len)?;
+                        } else {
+                            self.disk.write_zeroes(offset, len)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => *status = Status::OK.into(),
+                    Err(e) => {
+                        log::error!("{}: discard/write-zeroes: {e}", self.name);
+                        *status = Status::IOERR.into();
+                    }
+                }
+                Ok(BlkRequest::Done { written: 1 })
+            }
             RequestType::GET_ID => {
                 let mut name_bytes = self.name.as_bytes();
                 let count = name_bytes.read_vectored(data_in)? as u32;

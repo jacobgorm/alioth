@@ -88,7 +88,11 @@ result in `./result`.
     [vmnet framework](https://developer.apple.com/documentation/vmnet) on macOS.
   - `vsock`: Backed by either the host's `/dev/vhost-vsock` or a Unix domain
     socket.
-  - `blk`: Backed by a raw disk image.
+  - `blk`: Backed by a raw disk image, or by a
+    [mindcastle block-swap](https://github.com/jacobgorm/mindcastle.io)
+    `.swap` image when built with the `swap-disk` feature (needs a
+    `mindcastle.io` checkout next to this repository, see
+    `../mindcastle.io/mindcastle-rs`).
   - `entropy`: Backed by the host's `/dev/urandom`.
   - `fs`: Backed by [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) with
     experimental Direct Access (DAX) support.
